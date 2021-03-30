@@ -1,0 +1,185 @@
+---
+- name: Test OCP Connection
+  hosts: localhost
+  become: true
+  gather_facts: false
+  vars_files:
+    - ./vars/ocp.yml
+  vars:
+    ocp_ssh_key_file: "{{ cluster_dir }}/ocp_install_ssh_key_rsa"
+    ocp_ssh_pub_key_file: "{{ cluster_dir }}/ocp_install_ssh_key_rsa.pub"
+
+  tasks:
+
+  - name: Create the Openshift Install ID Group 
+    ansible.builtin.group:
+      name: "{{ ocp_install_user }}"
+      state: present
+
+  - name: "Create the OpenShift Install ID - {{ ocp_install_user }}"
+    ansible.builtin.user:
+      name: "{{ ocp_install_user }}"
+      comment: "OCP Installation Service ID"
+      group: "{{ ocp_install_user }}"
+      shell: /bin/bash
+      generate_ssh_key: true
+      ssh_key_bits: 4096
+      ssh_key_file: .ssh/id_rsa
+
+  - name: Create the OpenShift installation directory if it does not exist
+    ansible.builtin.file:
+      path: "{{ cluster_dir }}/install"
+      state: directory
+      owner: "{{ ocp_install_user }}"
+      group: "{{ ocp_install_user }}"
+      mode: "0755"
+
+  - name: Generate Openshift Installation SSH Key
+    openssh_keypair:
+      path: "{{ cluster_dir }}/ocp_install_ssh_key_rsa"
+      type: rsa
+      size: 4096
+      state: present
+      force: no
+
+  - name: Store the contents of the OCP SSH Key
+    set_fact:
+      ocp_ssh_key: "{{ lookup('file', ocp_ssh_pub_key_file) }}"
+  
+  - name: Create custom install-config.yaml file
+    ansible.builtin.template:
+      src: templates/install-config.yaml.j2
+      dest: "{{ cluster_dir }}/install-config.yaml"
+      owner: "{{ ocp_install_user }}"
+      group: "{{ ocp_install_user }}"
+      mode: "0644"
+
+#    ansible.builtin.copy:
+#      src: files/install-config.yaml
+#      dest: "{{ cluster_dir }}/install-config.yaml"
+#      owner: "{{ ocp_install_user }}"
+#      group: "{{ ocp_install_user }}"
+#      mode: "0644"
+
+  - name: Look for oc client 
+    stat:
+      path: "{{ cli_install_dir }}/oc"
+    register: oc_file
+
+  - name: Get oc client version
+    shell: | 
+      set -o pipefail
+      {{ cli_install_dir }}/oc version
+    args:
+      executable: /bin/bash
+      warn: false
+    register: oc_version
+    changed_when: false
+    when: 
+      - oc_file.stat.exists
+    
+  - name: Extract "oc" to {{ cli_install_dir }}
+    ansible.builtin.unarchive:
+      src: "{{ oc_url }}"
+      dest: "{{ cli_install_dir }}"
+      remote_src: yes
+    when: 
+      - not oc_file.stat.exists
+      - oc_version.stdout is not defined or ocp_z not in oc_version.stdout
+
+  - name: Look for openshift-install binary
+    stat:
+      path: "{{ cli_install_dir }}/openshift-install"
+    register: openshift_install_file
+
+  - name: Get openshift-install version
+    shell: | 
+      set -o pipefail
+      {{ cli_install_dir }}/openshift-install version
+    args:
+      executable: /bin/bash
+      warn: false
+    register: openshift_install_version
+    changed_when: false
+    when: 
+      - openshift_install_file.stat.exists
+
+  - name: Extract "openshift-install" to {{ cli_install_dir }}
+    ansible.builtin.unarchive:
+      src: "{{ openshift_install_url }}"
+      dest: "{{ cli_install_dir }}"
+      remote_src: yes
+    when: 
+      - not openshift_install_file.stat.exists
+      - openshift_install_version.stdout is not defined or ocp_z not in openshift_install_version.stdout
+
+  - name: Install bash-completion
+    yum:
+      name: 
+        - bash-completion
+      state: present
+
+  - name: Look for oc_bash_completion
+    stat:
+      path: /etc/bash_completion.d/oc_bash_completion
+    register: oc_bash_completion
+
+  - name: Generate oc_bash_completion
+    shell: | 
+      set -o pipefail
+      {{ cli_install_dir }}/oc completion bash > /etc/bash_completion.d/oc_bash_completion
+    args:
+      executable: /bin/bash
+      warn: false
+    register: openshift_install_version
+    when: 
+      - not oc_bash_completion.stat.exists
+
+
+
+  - name: Look For Existing VCenter CA Certificates
+    stat:
+      path: "{{ cluster_dir }}/{{ vsphere_hostname }}_certs.zip"
+    register: vcenter_ca_certs
+
+  - name: Install VCenter CA Certificates
+    block: 
+    - name: Pull the VCenter CA Certificates
+      get_url:
+        url: "https://{{ vsphere_hostname }}/certs/download.zip"
+        dest: "{{ cluster_dir }}/{{ vsphere_hostname }}_certs.zip"
+        validate_certs: false
+   
+    - name: Create tmp cert dir
+      file:
+        dest: "/tmp/{{ vsphere_hostname }}_certs"
+        state: directory
+
+    - name: Extract vcenter CA Certificats
+      ansible.builtin.unarchive:
+        src: "{{ cluster_dir }}/{{ vsphere_hostname }}_certs.zip"
+        dest: "/tmp/{{ vsphere_hostname }}_certs"
+    
+    - name: Copy vcenter CA Certificats to /etc
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "/etc/pki/ca-trust/source/anchors"
+        remote_src: true
+      with_fileglob:
+        - "/tmp/{{ vsphere_hostname }}_certs/certs/lin/*"
+
+    - name: Update the system trust with venter CA Certificates
+      shell: |
+        set -o pipefail
+        /bin/update-ca-trust extract
+      args:
+        executable: /bin/bash
+        warn: false
+
+    when: 
+      - not vcenter_ca_certs.stat.exists
+      
+    
+
+
+##TODO IPI - Get certs for VCenter and apply to host
